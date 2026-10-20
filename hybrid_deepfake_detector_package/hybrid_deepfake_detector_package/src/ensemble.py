@@ -265,6 +265,23 @@ class HybridForensicPredictor:
         elif anomaly_score >= 0.88 and seam_detected and not firmly_real:
             p_fake_ensemble = max(p_fake_ensemble, anomaly_score * 0.80)
 
+        # --- Cross-Domain Anomaly Escalation ---
+        # When U-Net detects strong spatial anomalies AND ResNet shows
+        # corroborating texture suspicion, but CLIP is confident it's real,
+        # the image is likely a deepfake type outside CLIP's training domain
+        # (e.g., diffusion models, advanced GANs, non-face-swap generators).
+        # We compute a CLIP-independent spatial-texture assessment to
+        # prevent CLIP's blind spot from masking genuine forensic evidence.
+        escalation_applied = False
+        if (anomaly_score >= 0.70
+                and p_fake_resnet is not None and p_fake_resnet >= 0.15
+                and p_fake_clip < 0.20
+                and not firmly_real):
+            spatial_evidence = 0.35 * p_fake_resnet + 0.65 * anomaly_score
+            if spatial_evidence >= self.threshold:
+                p_fake_ensemble = max(p_fake_ensemble, spatial_evidence)
+                escalation_applied = True
+
         p_real_ensemble = 1.0 - p_fake_ensemble
 
         # Decision rule with calibrated threshold
@@ -278,7 +295,9 @@ class HybridForensicPredictor:
             resnet_vote = p_fake_resnet >= self.threshold
             unet_vote = anomaly_score >= self.threshold
 
-            if clip_vote == resnet_vote == unet_vote:
+            if escalation_applied:
+                consensus = "CROSS-DOMAIN ESCALATION (U-Net + ResNet Spatial-Texture Override)"
+            elif clip_vote == resnet_vote == unet_vote:
                 consensus = "STRONG TRI-STREAM CONSENSUS (All 3 Models in Firm Agreement)"
             elif clip_vote == resnet_vote:
                 consensus = "GLOBAL CONSENSUS (CLIP & ResNet Agreement)"
