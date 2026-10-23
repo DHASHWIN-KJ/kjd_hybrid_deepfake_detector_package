@@ -69,10 +69,40 @@ class CLIPLinearProbe(nn.Module):
         return torch.sigmoid(logits)
 
 
+class CLIPMLPProbe(nn.Module):
+    """
+    Enhanced Multi-Layer Forensic Probe head with LayerNorm and GELU.
+    Captures non-linear feature interactions for subtle face swaps.
+    """
+
+    def __init__(self, in_features: int = 768, hidden_dim: int = 256, dropout: float = 0.25):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns raw logits (B,)."""
+        return self.net(x).squeeze(-1)
+
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns probability of being Fake (B,) in [0, 1]."""
+        logits = self.forward(x)
+        return torch.sigmoid(logits)
+
+
 class CLIPDetector(nn.Module):
     """
     End-to-end CLIP Deepfake Detector:
-    Frozen CLIP visual backbone + Linear Probe head.
+    Frozen CLIP visual backbone + Linear/MLP Probe head.
     """
 
     def __init__(
@@ -83,18 +113,45 @@ class CLIPDetector(nn.Module):
     ):
         super().__init__()
         clip_path = os.path.expanduser("~/.cache/clip/ViT-L-14.pt")
+        if not os.path.isfile(clip_path):
+            local_check = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "checkpoints", "ViT-L-14.pt"))
+            if os.path.isfile(local_check):
+                clip_path = local_check
+            else:
+                print(f"[models] Downloading official OpenAI CLIP ViT-L/14 backbone to: {clip_path}")
+                os.makedirs(os.path.dirname(clip_path), exist_ok=True)
+                url = "https://openaipublic.azureedge.net/clip/models/b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836/ViT-L-14.pt"
+                import urllib.request
+                urllib.request.urlretrieve(url, clip_path)
+                print("[models] Download complete!")
+
         clip_model = torch.jit.load(clip_path, map_location=device)
         self.visual = clip_model.visual
         for p in self.visual.parameters():
             p.requires_grad = False
         self.visual.eval()
 
-        self.probe = probe_head if probe_head is not None else CLIPLinearProbe(in_features=768)
-        if checkpoint_path and os.path.isfile(checkpoint_path):
+        # Dynamic probe instantiation based on checkpoint weights
+        if probe_head is not None:
+            self.probe = probe_head
+        elif checkpoint_path and os.path.isfile(checkpoint_path):
             state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            if isinstance(state_dict, dict) and "probe_state_dict" in state_dict:
-                state_dict = state_dict["probe_state_dict"]
+            arch = "linear"
+            if isinstance(state_dict, dict):
+                arch = state_dict.get("model_architecture", "linear")
+                if "probe_state_dict" in state_dict:
+                    state_dict = state_dict["probe_state_dict"]
+
+            # Detect whether checkpoint is MLP or single Linear layer
+            is_mlp = (arch == "mlp") or any("net.0." in k for k in state_dict.keys())
+            if is_mlp:
+                self.probe = CLIPMLPProbe(in_features=768)
+            else:
+                self.probe = CLIPLinearProbe(in_features=768)
+
             self.probe.load_state_dict(state_dict)
+        else:
+            self.probe = CLIPLinearProbe(in_features=768)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():

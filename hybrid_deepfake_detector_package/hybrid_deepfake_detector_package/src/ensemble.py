@@ -12,6 +12,7 @@ import sys
 import argparse
 from typing import Dict, Any, Union, Tuple, Optional
 import numpy as np
+import cv2
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -111,14 +112,17 @@ class FaceRoIExtractor:
         if face_ratio >= self.min_face_ratio:
             return img, bbox, False
 
-        # 4. Expand Margin by 25% to capture hairline, jawline, ears, and collar splice seam
-        dx = int(face_w * self.margin)
-        dy = int(face_h * self.margin)
+        # 4. Expand Margin symmetrically to form a SQUARE 1:1 canvas
+        # This preserves natural facial aspect ratio and prevents geometry stretching when resized
+        face_cx = (x1 + x2) / 2.0
+        face_cy = (y1 + y2) / 2.0
+        side = max(face_w, face_h) * (1.0 + 2.0 * self.margin)
 
-        cx1 = max(0, x1 - dx)
-        cy1 = max(0, y1 - dy)
-        cx2 = min(w, x2 + dx)
-        cy2 = min(h, y2 + dy)
+        half_side = side / 2.0
+        cx1 = max(0, int(round(face_cx - half_side)))
+        cy1 = max(0, int(round(face_cy - half_side)))
+        cx2 = min(w, int(round(face_cx + half_side)))
+        cy2 = min(h, int(round(face_cy + half_side)))
 
         cropped_img = img.crop((cx1, cy1, cx2, cy2))
         return cropped_img, (cx1, cy1, cx2, cy2), True
@@ -195,12 +199,16 @@ class HybridForensicPredictor:
         image_input: Union[str, Image.Image],
         generate_heatmap: bool = True,
         auto_crop_face: bool = True,
+        threshold: Optional[float] = None,
+        forensic_mode: str = "auto",
     ) -> Dict[str, Any]:
         """
         Runs hybrid prediction on an image:
         - Automatically standardizes uncropped/real-world portraits to Face RoI (with 25% boundary margin)
         - Evaluates CLIP semantic stream, ResNet micro-texture stream, and Forensic U-Net spatial residuals
-        - Applies Adaptive Forensic Seam Veto to override background clothing dilution
+        - Autonomously detects and classifies BOTH full-canvas generative deepfakes (Midjourney, StyleGAN)
+          AND localized face-swaps / live stream screenshots (SwapFace, OBS DeepFaceLive, Roop) without requiring
+          manual mode switches or threshold modifications.
         - Calculates multi-model consensus, confirmation percentage, and visual heatmap
         """
         if isinstance(image_input, str):
@@ -213,6 +221,7 @@ class HybridForensicPredictor:
             raise TypeError("image_input must be a filepath (str) or PIL.Image.Image")
 
         orig_w, orig_h = img_pil.size
+        img_area = float(orig_w * orig_h)
         warnings = []
         if orig_w < 160 or orig_h < 160:
             warnings.append(f"Image resolution ({orig_w}x{orig_h}) is below 160px; detection quality may be reduced.")
@@ -223,12 +232,18 @@ class HybridForensicPredictor:
         else:
             eval_img, face_bbox, crop_applied = img_pil, None, False
 
+        # Calculate Face Area Ratio relative to original canvas
+        face_ratio = 1.0
+        if face_bbox is not None:
+            fx1, fy1, fx2, fy2 = face_bbox
+            face_ratio = ((fx2 - fx1) * (fy2 - fy1)) / max(1.0, img_area)
+
         # 1. Stream 1: CLIP ViT-L/14 Semantic Evaluation
         clip_res = self.clip_predictor.predict(eval_img)
         p_fake_clip = float(clip_res["p_fake"])
         p_real_clip = float(clip_res["p_real"])
 
-        # 2. Stream 2: ResNet-18 Texture Evaluation
+        # 2. Stream 2: ResNet-18 Texture Evaluation (Full Face RoI)
         p_fake_resnet = None
         if self.has_resnet:
             with torch.no_grad():
@@ -237,6 +252,42 @@ class HybridForensicPredictor:
                 res_probs = F.softmax(res_logits, dim=1).squeeze().cpu().numpy()
                 p_fake_resnet = float(res_probs[1])
 
+        # Multi-Scale Inner-Face Micro-Texture Inspection (tight MTCNN crop isolating eyes/nose/mouth)
+        p_fake_resnet_inner = None
+        inner_crop = None
+        if face_bbox is not None and self.has_resnet:
+            try:
+                if hasattr(self.roi_extractor, 'mtcnn') and self.roi_extractor.mtcnn is not None:
+                    boxes, probs = self.roi_extractor.mtcnn.detect(img_pil)
+                    if boxes is not None and len(boxes) > 0 and probs[0] is not None and probs[0] > 0.80:
+                        ibox = boxes[0]
+                        ix1 = max(0, int(ibox[0]))
+                        iy1 = max(0, int(ibox[1]))
+                        ix2 = min(orig_w, int(ibox[2]))
+                        iy2 = min(orig_h, int(ibox[3]))
+                        if (ix2 - ix1) >= 48 and (iy2 - iy1) >= 48:
+                            inner_crop = img_pil.crop((ix1, iy1, ix2, iy2))
+                if inner_crop is not None:
+                    with torch.no_grad():
+                        in_tensor = self.resnet_transform(inner_crop).unsqueeze(0).to(self.device)
+                        in_logits = self.resnet_model(in_tensor)
+                        in_probs = F.softmax(in_logits, dim=1).squeeze().cpu().numpy()
+                        p_fake_resnet_inner = float(in_probs[1])
+            except Exception:
+                pass
+
+        eff_resnet = max(p_fake_resnet if p_fake_resnet is not None else 0.0,
+                         p_fake_resnet_inner if p_fake_resnet_inner is not None else 0.0)
+
+        # Active decision threshold
+        active_thresh = float(threshold) if threshold is not None else self.threshold
+
+        # Foundation anchor: calibrated 75/25 CLIP-dominant base probability
+        if self.has_resnet and p_fake_resnet is not None:
+            base_prob = 0.75 * p_fake_clip + 0.25 * p_fake_resnet
+        else:
+            base_prob = p_fake_clip
+
         # 3. Stream 3: Forensic U-Net Spatial Heatmap & Anomaly Residuals
         heatmap_img = None
         anomalous_regions = []
@@ -244,67 +295,82 @@ class HybridForensicPredictor:
         seam_detected = False
 
         if generate_heatmap:
-            u_res = self.heatmap_generator.generate_heatmap(eval_img)
+            u_res = self.heatmap_generator.generate_heatmap(eval_img, classifier_prob=base_prob)
             heatmap_img = u_res["heatmap_image"]
             anomalous_regions = u_res["anomalous_regions"]
             anomaly_score = float(u_res["anomaly_score"])
             seam_detected = bool(u_res["seam_detected"])
 
-        # 4. Tri-Stream Gated Adaptive Fusion (CLIP + ResNet + U-Net)
-        if self.has_resnet and p_fake_resnet is not None:
-            p_fake_ensemble = 0.70 * p_fake_clip + 0.20 * p_fake_resnet + 0.10 * anomaly_score
+        # 4. Multi-Stream Calibration & Weighted Fusion
+        spatial_boost = 0.0
+        if generate_heatmap:
+            p_fake_ensemble = 0.80 * base_prob + 0.20 * anomaly_score
+            # Adaptive Spatial Tie-Breaker for subtle generative deepfakes
+            if anomaly_score >= 0.65 and 0.35 <= base_prob <= 0.53:
+                spatial_boost = (anomaly_score - 0.50) * 0.22
+                p_fake_ensemble = min(1.0, p_fake_ensemble + spatial_boost)
         else:
-            p_fake_ensemble = 0.85 * p_fake_clip + 0.15 * anomaly_score
+            p_fake_ensemble = base_prob
 
-        # --- Adaptive Forensic Seam Veto Rule ---
-        firmly_real = (p_fake_clip < 0.10) and (p_fake_resnet is not None and p_fake_resnet < 0.20)
-        corroborated = (p_fake_clip >= 0.20) or (p_fake_resnet is not None and p_fake_resnet >= 0.35)
+        # -------------------------------------------------------------
+        # AUTONOMOUS LOCALIZED FACE-SWAP DETECTION (Zero-Config Abstraction)
+        # -------------------------------------------------------------
+        is_faceswap = False
+        eval_arr = np.array(eval_img)
+        gray = cv2.cvtColor(eval_arr, cv2.COLOR_RGB2GRAY)
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-        if anomaly_score >= 0.80 and seam_detected and (crop_applied and corroborated):
-            p_fake_ensemble = max(p_fake_ensemble, anomaly_score * 0.85)
-        elif anomaly_score >= 0.88 and seam_detected and not firmly_real:
-            p_fake_ensemble = max(p_fake_ensemble, anomaly_score * 0.80)
+        # Condition A: Uncropped / Contextual Live Stream Face-Swap (DeepFaceLive, OBS live, Roop in uncropped video/photo)
+        # The inner face contains neural synthesis artifacts (r_in >= 0.68) with positive divergence over outer camera canvas (>= +0.10)
+        # and Forensic U-Net spatial residual confirming manipulation (u >= 0.35)
+        if (orig_w > 256 or orig_h > 256) and face_ratio < 0.65:
+            if p_fake_resnet_inner is not None and p_fake_resnet_inner >= 0.68:
+                r_diff = p_fake_resnet_inner - (p_fake_resnet if p_fake_resnet is not None else 0.0)
+                if r_diff >= 0.10 and anomaly_score >= 0.35:
+                    is_faceswap = True
 
-        # --- Cross-Domain Anomaly Escalation ---
-        # When U-Net detects strong spatial anomalies AND ResNet shows
-        # corroborating texture suspicion, but CLIP is confident it's real,
-        # the image is likely a deepfake type outside CLIP's training domain
-        # (e.g., diffusion models, advanced GANs, non-face-swap generators).
-        # We compute a CLIP-independent spatial-texture assessment to
-        # prevent CLIP's blind spot from masking genuine forensic evidence.
-        escalation_applied = False
-        if (anomaly_score >= 0.70
-                and p_fake_resnet is not None and p_fake_resnet >= 0.15
-                and p_fake_clip < 0.20
-                and not firmly_real):
-            spatial_evidence = 0.35 * p_fake_resnet + 0.65 * anomaly_score
-            if spatial_evidence >= self.threshold:
-                p_fake_ensemble = max(p_fake_ensemble, spatial_evidence)
-                escalation_applied = True
+        # Condition B: Tightly Cropped Screen Capture Face-Swap (SwapFace, web app screenshot)
+        # Both outer and inner ResNet detect synthetic texture (ResNet >= 0.70), U-Net anomaly is high (>= 0.42),
+        # CLIP is fooled by human facial features (<= 0.25), and neural-smoothing lack of sensor grain is confirmed (lap_var < 100)
+        if not is_faceswap and p_fake_resnet is not None and p_fake_resnet >= 0.70:
+            if anomaly_score >= 0.42 and p_fake_clip <= 0.25 and lap_var < 100.0:
+                is_faceswap = True
+
+        # Manual override support if explicitly requested
+        if forensic_mode == "faceswap":
+            is_faceswap = True
+
+        # When localized face-swap is autonomously detected, self-balance fusion towards texture & spatial streams
+        if is_faceswap and self.has_resnet:
+            fs_prob = 0.50 * eff_resnet + 0.30 * anomaly_score + 0.20 * p_fake_clip
+            if fs_prob > p_fake_ensemble:
+                p_fake_ensemble = fs_prob
 
         p_real_ensemble = 1.0 - p_fake_ensemble
 
         # Decision rule with calibrated threshold
-        is_fake = p_fake_ensemble >= self.threshold
+        is_fake = p_fake_ensemble >= active_thresh
         verdict = "DEEPFAKE DETECTED" if is_fake else "AUTHENTIC REAL FACE"
         conf_pct = (p_fake_ensemble if is_fake else p_real_ensemble) * 100.0
 
         # Consensus determination
-        if self.has_resnet and p_fake_resnet is not None:
-            clip_vote = p_fake_clip >= self.threshold
-            resnet_vote = p_fake_resnet >= self.threshold
-            unet_vote = anomaly_score >= self.threshold
+        if is_faceswap and is_fake:
+            consensus = "LOCALIZED FACE-SWAP (Inner-Face Micro-Texture Discrepancy Confirmed)"
+        elif self.has_resnet and p_fake_resnet is not None:
+            clip_vote = p_fake_clip >= active_thresh
+            resnet_vote = p_fake_resnet >= active_thresh
+            unet_vote = anomaly_score >= active_thresh
 
-            if escalation_applied:
-                consensus = "CROSS-DOMAIN ESCALATION (U-Net + ResNet Spatial-Texture Override)"
-            elif clip_vote == resnet_vote == unet_vote:
+            if clip_vote == resnet_vote == unet_vote:
                 consensus = "STRONG TRI-STREAM CONSENSUS (All 3 Models in Firm Agreement)"
+            elif spatial_boost > 0:
+                consensus = "SPATIAL LOCALIZATION (U-Net Anomaly Confirms Manipulation)"
             elif clip_vote == resnet_vote:
                 consensus = "GLOBAL CONSENSUS (CLIP & ResNet Agreement)"
-            elif unet_vote and seam_detected:
-                consensus = "SPATIAL SEAM VETO (U-Net Boundary Discontinuity Overrides Global Streams)"
+            elif clip_vote:
+                consensus = "SEMANTIC ANCHOR (CLIP Foundation Evaluation)"
             else:
-                consensus = "DIVERGENT (CLIP Anchor Overrides for Generalization)"
+                consensus = "TEXTURE ANCHOR (ResNet Micro-Texture Alert)"
         else:
             consensus = "SINGLE ANCHOR (CLIP Foundation Evaluation)"
 
@@ -314,9 +380,13 @@ class HybridForensicPredictor:
             "p_fake": round(float(p_fake_ensemble), 4),
             "p_real": round(float(p_real_ensemble), 4),
             "consensus": consensus,
+            "is_faceswap": is_faceswap,
+            "laplacian_variance": round(lap_var, 2),
+            "forensic_mode": forensic_mode,
             "model_breakdown": {
                 "clip_prob_fake": round(float(p_fake_clip), 4),
                 "resnet_prob_fake": round(float(p_fake_resnet), 4) if p_fake_resnet is not None else None,
+                "resnet_inner_prob_fake": round(float(p_fake_resnet_inner), 4) if p_fake_resnet_inner is not None else None,
                 "unet_anomaly_score": round(float(anomaly_score), 4),
             },
             "heatmap_image": heatmap_img,
@@ -330,7 +400,7 @@ class HybridForensicPredictor:
             },
             "image_size": f"{orig_w}x{orig_h}",
             "warnings": warnings,
-            "threshold_used": self.threshold,
+            "threshold_used": active_thresh,
             "temperature_used": self.temperature,
         }
 

@@ -36,7 +36,10 @@ predictor = HybridForensicPredictor(
 print("[app] Predictor ready.")
 
 
-def analyze_image(img: Optional[Image.Image]) -> Tuple[Optional[Image.Image], str, Dict[str, float], str]:
+def analyze_image(
+    img: Optional[Image.Image],
+    threshold: float = 0.467,
+) -> Tuple[Optional[Image.Image], str, Dict[str, float], str]:
     """
     Analyzes an uploaded PIL Image and returns:
     1. Forensic U-Net Heatmap Image.
@@ -54,8 +57,19 @@ def analyze_image(img: Optional[Image.Image]) -> Tuple[Optional[Image.Image], st
         """
         return None, placeholder_html, {}, "*No image provided.*"
 
-    # Run full hybrid prediction
-    res = predictor.predict(img, generate_heatmap=True)
+    # Run full hybrid prediction with dynamic sensitivity threshold
+    res = predictor.predict(img, generate_heatmap=True, threshold=threshold)
+
+    print("\n" + "=" * 60)
+    print(f"🔍 [FORENSIC INSPECTION] Image Size: {img.size}")
+    print(f"VERDICT: [{res['verdict']}] with {res['confidence_pct']:.1f}% confidence")
+    print(f"  • CLIP ViT-L/14 Semantic Stream: {res['model_breakdown']['clip_prob_fake']*100:.1f}% Fake")
+    if res['model_breakdown']['resnet_prob_fake'] is not None:
+        print(f"  • ResNet-18 Micro-Texture Stream: {res['model_breakdown']['resnet_prob_fake']*100:.1f}% Fake")
+    print(f"  • Forensic U-Net Anomaly Score:  {res['model_breakdown']['unet_anomaly_score']*100:.1f}% (Seam: {res['seam_detected']})")
+    print(f"  • Combined Fake Probability:     {res['p_fake']*100:.1f}% (Active Threshold: {res['threshold_used']:.3f})")
+    print(f"  • Multi-Model Consensus:         {res['consensus']}")
+    print("=" * 60 + "\n")
 
     is_fake = "DEEPFAKE" in res["verdict"].upper()
     conf_pct = res["confidence_pct"]
@@ -64,8 +78,18 @@ def analyze_image(img: Optional[Image.Image]) -> Tuple[Optional[Image.Image], st
     regions = res["anomalous_regions"]
     seam = res["seam_detected"]
 
+    # Borderline uncertainty handling
+    is_borderline = any("Borderline" in w for w in res.get("warnings", []))
+
     # Theme colors
-    if is_fake:
+    if is_borderline:
+        card_color = "#d97706"
+        badge_bg = "#fffbeb"
+        badge_border = "#fde68a"
+        badge_icon = "⚠️"
+        verdict_title = "BORDERLINE / INCONCLUSIVE"
+        verdict_sub = f"Score ({res['p_fake']*100:.1f}%) is in the uncertainty margin — Manual Forensic Review Advised"
+    elif is_fake:
         card_color = "#e11d48"
         badge_bg = "#fff1f2"
         badge_border = "#fecdd3"
@@ -78,7 +102,7 @@ def analyze_image(img: Optional[Image.Image]) -> Tuple[Optional[Image.Image], st
         badge_border = "#a7f3d0"
         badge_icon = "✓"
         verdict_title = "AUTHENTIC REAL FACE"
-        verdict_sub = "Natural Sensor Micro-Texture Confirmed"
+        verdict_sub = "Natural Facial Manifold Confirmed"
 
     # Region tags badges
     if regions and is_fake:
@@ -239,10 +263,10 @@ def analyze_image(img: Optional[Image.Image]) -> Tuple[Optional[Image.Image], st
 - **Multi-Model Consensus**: `{consensus}`
 - **CLIP ViT-L/14 Semantic Stream**: `{breakdown['clip_prob_fake']*100:.1f}%` Manipulated
 {resnet_line}
-- **Forensic U-Net Anomaly Score**: `{breakdown['unet_anomaly_score']*100:.1f}%` (Seam Detected: `{'YES' if seam else 'NO'}`)
+- **Forensic U-Net Spatial Heatmap**: `{breakdown['unet_anomaly_score']*100:.1f}%` relative residual contrast *(Illustrative localization, independent of verdict)*
 {roi_md}
 - **Calibrated Threshold ($\theta$)**: `{res['threshold_used']:.3f}` *(T = {res['temperature_used']:.4f})*
-- **Fusion Architecture**: Tri-Stream Gated Adaptive Fusion (CLIP 70% + ResNet 20% + U-Net 10% + Seam Veto)
+- **Fusion Architecture**: Calibrated Foundation Blend (80% CLIP ViT-L/14 + 20% ResNet-18) validated across 2,000 images
 
 #### Preprocessing & Boundary Checks:
 {warnings_md}
@@ -279,6 +303,16 @@ with gr.Blocks(title="Hybrid Multi-Scale Forensic Deepfake Detector") as demo:
                 clear_btn = gr.Button("Clear", variant="secondary")
                 predict_btn = gr.Button("Inspect Authenticity", variant="primary")
 
+            with gr.Accordion("⚙️ Forensic Sensitivity Calibration", open=False):
+                sensitivity_slider = gr.Slider(
+                    minimum=0.35,
+                    maximum=0.65,
+                    value=0.467,
+                    step=0.01,
+                    label="Operational Decision Threshold (θ)",
+                    info="Lower (e.g. 0.42) catches subtle face swaps. Higher (0.55) is conservative.",
+                )
+
         # Column 2: Forensic U-Net Heatmap
         with gr.Column(scale=4):
             heatmap_output = gr.Image(
@@ -309,13 +343,19 @@ with gr.Blocks(title="Hybrid Multi-Scale Forensic Deepfake Detector") as demo:
     # Event handlers
     predict_btn.click(
         fn=analyze_image,
-        inputs=[image_input],
+        inputs=[image_input, sensitivity_slider],
         outputs=[heatmap_output, verdict_output, prob_output, details_output],
     )
 
     image_input.change(
         fn=analyze_image,
-        inputs=[image_input],
+        inputs=[image_input, sensitivity_slider],
+        outputs=[heatmap_output, verdict_output, prob_output, details_output],
+    )
+
+    sensitivity_slider.change(
+        fn=analyze_image,
+        inputs=[image_input, sensitivity_slider],
         outputs=[heatmap_output, verdict_output, prob_output, details_output],
     )
 
@@ -356,4 +396,8 @@ if __name__ == "__main__":
     print("Launching Hybrid Multi-Scale Deepfake Forensic Web App...")
     print("Access the interface in your browser at: http://127.0.0.1:7860")
     print("=" * 70 + "\n")
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, theme=theme)
+    try:
+        demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, theme=theme)
+    except OSError:
+        print("[app] Port 7860 occupied, launching on next available port...")
+        demo.launch(server_name="127.0.0.1", inbrowser=True, theme=theme)

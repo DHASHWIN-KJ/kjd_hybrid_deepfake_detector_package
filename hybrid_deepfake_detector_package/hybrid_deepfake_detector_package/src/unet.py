@@ -9,7 +9,7 @@ Implements:
 """
 
 import os
-from typing import Dict, Any, List, Tuple, Union
+from typing import Dict, Any, List, Tuple, Union, Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -176,10 +176,11 @@ class ForensicHeatmapGenerator:
         self,
         image_input: Union[str, Image.Image],
         target_size: Tuple[int, int] = (256, 256),
+        classifier_prob: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Analyzes an image and returns:
-        - heatmap_image: PIL Image with glowing red/yellow highlight over manipulated regions
+        - heatmap_image: PIL Image with glowing highlight over manipulated regions
         - raw_heatmap: 2D numpy array [0, 1]
         - anomalous_regions: list of detected facial zones (eyes, mouth, boundary seam)
         - anomaly_score: float in [0.0, 1.0]
@@ -204,84 +205,108 @@ class ForensicHeatmapGenerator:
         x_in = torch.tensor(img_np.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
         x_norm = x_in * 2.0 - 1.0
 
+        h, w = target_size
+        y_grid, x_grid = np.ogrid[:h, :w]
+        cy, cx = h * 0.50, w * 0.50
+        ry, rx = h * 0.44, w * 0.38
+        dist_sq = ((x_grid - cx) / rx) ** 2 + ((y_grid - cy) / ry) ** 2
+        # Smooth anatomical face ellipse mask (1 inside face, 0 outside in background/clothing)
+        face_mask = 1.0 / (1.0 + np.exp(np.clip((dist_sq - 1.0) * 10.0, -20.0, 20.0)))
+
         with torch.no_grad():
             recon, u_mask = self.unet(x_norm)
             
             # 1. Multi-scale spatial residual from U-Net reconstruction
-            recon_res = torch.abs(x_norm - recon).mean(dim=1, keepdim=True)
+            recon_res = torch.abs(x_norm - recon).mean(dim=1).squeeze().cpu().numpy()
             
             # 2. High-pass boundary seam residual
-            freq_res = self._extract_frequency_residuals(x_in)
+            freq_res = self._extract_frequency_residuals(x_in).squeeze().cpu().numpy()
             
-            # Combined spatial anomaly signal
-            combined = 0.55 * recon_res + 0.45 * freq_res + 0.20 * u_mask
-            heatmap_raw = combined.squeeze().cpu().numpy()
+            # Mask out background wall, collars, and room objects to eliminate false perimeter edges
+            masked_recon = recon_res * face_mask
+            masked_freq = freq_res * face_mask
+            
+            combined = 0.65 * masked_recon + 0.35 * masked_freq
 
-        # Smooth and normalize heatmap
-        heatmap_smoothed = cv2.GaussianBlur(heatmap_raw, (15, 15), 0)
+        # Smooth heatmap
+        heatmap_smoothed = cv2.GaussianBlur(combined, (15, 15), 0)
         
-        # Robust min-max scaling using 5th and 98th percentiles
-        p_low = np.percentile(heatmap_smoothed, 8)
-        p_high = np.percentile(heatmap_smoothed, 96)
-        if p_high > p_low:
-            norm_map = np.clip((heatmap_smoothed - p_low) / (p_high - p_low), 0.0, 1.0)
+        # Robust scaling strictly within the facial region
+        face_pixels = heatmap_smoothed[face_mask > 0.4]
+        if len(face_pixels) > 0:
+            p_low = np.percentile(face_pixels, 15)
+            p_high = np.percentile(face_pixels, 95)
+            if p_high > p_low + 1e-4:
+                norm_map = np.clip((heatmap_smoothed - p_low) / (p_high - p_low), 0.0, 1.0) * face_mask
+            else:
+                norm_map = np.zeros_like(heatmap_smoothed)
         else:
             norm_map = np.zeros_like(heatmap_smoothed)
 
-        # Calculate anomaly score (mean of top 12% hottest pixels)
-        flat_sorted = np.sort(norm_map.flatten())
-        top_k = int(0.12 * len(flat_sorted))
-        anomaly_score = float(np.mean(flat_sorted[-top_k:])) if top_k > 0 else 0.0
+        # Calculate spatial residual contrast (concentrated spikes vs uniform manifold)
+        if len(face_pixels) > 0:
+            p_med = float(np.median(face_pixels))
+            p_95 = float(np.percentile(face_pixels, 95))
+            spatial_contrast = (p_95 - p_med) / max(p_95 + 1e-4, 0.05)
+            anomaly_raw = float(np.clip(spatial_contrast * 1.4, 0.05, 0.95))
+        else:
+            anomaly_raw = 0.0
+
+        if classifier_prob is not None:
+            anomaly_score = float(np.clip(0.35 * anomaly_raw + 0.65 * classifier_prob, 0.0, 1.0))
+        else:
+            anomaly_score = anomaly_raw
 
         # Identify anatomical face regions from high-activation coordinates
-        h, w = target_size
-        y_grid, x_grid = np.ogrid[:h, :w]
-        
-        # Threshold for anomalous hotspot pixels
-        hot_mask = norm_map >= 0.65
+        hot_mask = (norm_map >= 0.65) & (face_mask > 0.4)
         hot_y, hot_x = np.where(hot_mask)
         
         anomalous_regions = []
         seam_detected = False
 
-        if len(hot_y) > 30:
-            # Normalized coordinates
+        # Only tag anomalous regions if manipulation is confirmed by classifier or high spatial anomaly
+        is_suspicious = (classifier_prob is None or classifier_prob >= 0.45) and anomaly_score >= 0.35
+
+        if is_suspicious and len(hot_y) > 40:
             norm_y = hot_y / float(h)
             norm_x = hot_x / float(w)
 
-            # Check Eye / Periorbital zone (y: 22% - 46%, x: 18% - 82%)
-            eye_pts = np.sum((norm_y >= 0.22) & (norm_y <= 0.46) & (norm_x >= 0.18) & (norm_x <= 0.82))
-            if eye_pts > 0.15 * len(hot_y):
+            # Check Eye / Periorbital zone (y: 24% - 46%, x: 20% - 80%)
+            eye_pts = np.sum((norm_y >= 0.24) & (norm_y <= 0.46) & (norm_x >= 0.20) & (norm_x <= 0.80))
+            if eye_pts > 0.20 * len(hot_y):
                 anomalous_regions.append("Eye / Periorbital Region")
 
-            # Check Mouth / Lip zone (y: 62% - 86%, x: 25% - 75%)
-            mouth_pts = np.sum((norm_y >= 0.62) & (norm_y <= 0.86) & (norm_x >= 0.25) & (norm_x <= 0.75))
-            if mouth_pts > 0.15 * len(hot_y):
+            # Check Mouth / Lip zone (y: 60% - 84%, x: 26% - 74%)
+            mouth_pts = np.sum((norm_y >= 0.60) & (norm_y <= 0.84) & (norm_x >= 0.26) & (norm_x <= 0.74))
+            if mouth_pts > 0.20 * len(hot_y):
                 anomalous_regions.append("Mouth / Lip Boundary")
 
             # Check Mid-face / Nose zone (y: 42% - 62%, x: 32% - 68%)
             nose_pts = np.sum((norm_y >= 0.42) & (norm_y <= 0.62) & (norm_x >= 0.32) & (norm_x <= 0.68))
-            if nose_pts > 0.15 * len(hot_y):
+            if nose_pts > 0.20 * len(hot_y):
                 anomalous_regions.append("Nose / Mid-Face Region")
 
-            # Check Outer Perimeter / Jawline Blending Seam
-            perimeter_pts = np.sum(
-                (norm_y <= 0.15) | (norm_y >= 0.85) | (norm_x <= 0.15) | (norm_x >= 0.85)
-            )
-            if perimeter_pts > 0.15 * len(hot_y):
+            # Check Facial Contour / Blending Seam (points along the outer facial ellipse boundary)
+            border_dist = dist_sq[hot_y, hot_x]
+            seam_pts = np.sum((border_dist >= 0.65) & (border_dist <= 1.15))
+            if seam_pts > 0.25 * len(hot_y):
                 anomalous_regions.append("Facial Contour / Blending Seam")
                 seam_detected = True
 
         if not anomalous_regions:
-            anomalous_regions = ["No Localized Anomalies (Uniform Texture)"]
+            anomalous_regions = ["Smooth Natural Manifold (Uniform Low Residuals)"]
 
         # Generate Colormap Overlay using OpenCV (COLORMAP_JET)
         heatmap_uint8 = (norm_map * 255.0).astype(np.uint8)
         color_map = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
         color_map = cv2.cvtColor(color_map, cv2.COLOR_BGR2RGB)
 
-        # Adaptive alpha: cold regions stay mostly transparent, hotspots glow
-        alpha = (norm_map ** 1.5) * 0.60
+        # Adaptive alpha: cool/clean regions remain transparent, background is 100% clear
+        if classifier_prob is not None and classifier_prob < 0.45:
+            alpha_scale = min(0.35, max(0.04, classifier_prob * 0.7))
+        else:
+            alpha_scale = min(1.0, max(0.12, anomaly_score * 1.1))
+        alpha = np.clip((norm_map - 0.20) / 0.80, 0.0, 1.0) ** 1.8 * 0.70 * alpha_scale
         alpha_3d = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
 
         base_uint8 = (img_np * 255.0).astype(np.uint8)
